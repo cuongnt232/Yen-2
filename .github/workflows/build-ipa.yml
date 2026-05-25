@@ -1,0 +1,107 @@
+name: Build iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fix text file encodings from Windows upload
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          def fix_file(path: Path):
+              data = path.read_bytes()
+              if not data:
+                  return
+              if data.startswith(b"\xff\xfe"):
+                  text = data.decode("utf-16-le")
+              elif data.startswith(b"\xfe\xff"):
+                  text = data.decode("utf-16-be")
+              elif data.startswith(b"\xef\xbb\xbf"):
+                  text = data[3:].decode("utf-8")
+              else:
+                  try:
+                      text = data.decode("utf-8")
+                  except UnicodeDecodeError:
+                      try:
+                          text = data.decode("utf-16-le")
+                      except UnicodeDecodeError:
+                          return
+              path.write_text(text.replace("\r\n", "\n"), encoding="utf-8")
+
+          for pattern in ["*.yml", "*.yaml", "*.swift", "*.m", "*.h", "*.plist", "*.json"]:
+              for path in Path(".").rglob(pattern):
+                  if ".git" in path.parts:
+                      continue
+                  fix_file(path)
+          print("Encoding fix complete")
+          PY
+
+      - name: Setup Xcode 16
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project on Mac
+        run: |
+          xcodegen generate
+          xcodebuild -list -project CellNetMonitor.xcodeproj
+
+      - name: Build unsigned app for device
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project CellNetMonitor.xcodeproj \
+            -scheme CellNetMonitor \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            ONLY_ACTIVE_ARCH=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            build 2>&1 | tee build.log
+
+      - name: Package IPA
+        run: |
+          set -euo pipefail
+          APP_PATH="build/DerivedData/Build/Products/Release-iphoneos/CellNetMonitor.app"
+          if [ ! -d "$APP_PATH" ]; then
+            echo "App not found at $APP_PATH"
+            find build -name "*.app" -type d
+            exit 1
+          fi
+          mkdir -p dist/Payload
+          cp -R "$APP_PATH" dist/Payload/
+          cd dist
+          zip -qr CellNetMonitor-unsigned.ipa Payload
+          ls -lh dist/
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CellNetMonitor-ipa
+          path: dist/CellNetMonitor-unsigned.ipa
+          if-no-files-found: error
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
